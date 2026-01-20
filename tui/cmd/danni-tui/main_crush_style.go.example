@@ -1,0 +1,303 @@
+package main
+
+import (
+	"fmt"
+	"os"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/bubbles/textarea"
+	"github.com/charmbracelet/bubbles/viewport"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/exp/charmtone"
+	"github.com/subfracture/danni/tui/internal/bridge"
+)
+
+// Clean color palette inspired by Crush and DROID
+var (
+	// Backgrounds - Dark but not harsh
+	bgBase    = lipgloss.Color("#1a1f2e") // Dark blue-gray like DROID
+	bgSurface = lipgloss.Color("#2b3447") // Slightly lighter
+
+	// Text - Readable and soft
+	fgBase   = lipgloss.Color("#e0e6ed") // Soft white
+	fgMuted  = lipgloss.Color("#8892a8") // Muted gray
+	fgSubtle = lipgloss.Color("#64708c") // Even more muted
+
+	// ONE accent color - used sparingly
+	accent = lipgloss.Color("#ffd369") // Warm gold (Danni's gold, but muted)
+
+	// Status colors - soft, not aggressive
+	success = lipgloss.Color("#4ade80")
+	warning = lipgloss.Color("#fb923c")
+	error   = lipgloss.Color("#f87171")
+)
+
+// Styles - minimal and clean
+var (
+	baseStyle = lipgloss.NewStyle().
+		Background(bgBase).
+		Foreground(fgBase)
+
+	headerStyle = lipgloss.NewStyle().
+		Foreground(fgMuted).
+		Padding(0, 1)
+
+	messageStyle = lipgloss.NewStyle().
+		Foreground(fgBase).
+		PaddingLeft(2).
+		MarginBottom(1)
+
+	danniStyle = lipgloss.NewStyle().
+		Foreground(accent). // Subtle gold accent for Danni
+		PaddingLeft(2).
+		MarginBottom(1)
+
+	userStyle = lipgloss.NewStyle().
+		Foreground(fgBase).
+		Bold(true).
+		PaddingLeft(2).
+		MarginBottom(1)
+
+	statusStyle = lipgloss.NewStyle().
+		Foreground(fgSubtle).
+		Padding(0, 1)
+
+	inputStyle = lipgloss.NewStyle().
+		BorderStyle(lipgloss.NormalBorder()).
+		BorderTop(true).
+		BorderForeground(lipgloss.Color("#3e4452")). // Very subtle border
+		Padding(0, 1)
+)
+
+type model struct {
+	width, height int
+	viewport      viewport.Model
+	textarea      textarea.Model
+	messages      []message
+	cli           *bridge.CLI
+	thinking      bool
+	ready         bool
+
+	// Status info
+	module        string
+	sessionID     string
+	tokensUsed    int
+}
+
+type message struct {
+	role    string // "user", "danni", "system"
+	content string
+}
+
+func initialModel() (model, error) {
+	// Find and create CLI bridge
+	cli, err := bridge.NewCLI("../target/release/danni")
+	if err != nil {
+		return model{}, err
+	}
+
+	// Simple textarea - no fancy colors
+	ta := textarea.New()
+	ta.Placeholder = "Type your message..."
+	ta.Focus()
+	ta.Prompt = "> "
+	ta.CharLimit = 8192
+	ta.ShowLineNumbers = false
+
+	// Clean styling for textarea
+	ta.FocusedStyle.Base = lipgloss.NewStyle().
+		Foreground(fgBase)
+	ta.FocusedStyle.Placeholder = lipgloss.NewStyle().
+		Foreground(fgSubtle)
+
+	return model{
+		textarea:  ta,
+		cli:       cli,
+		module:    "/strategy",
+		messages: []message{
+			{
+				role:    "system",
+				content: "DANNI - Strategic Intelligence System",
+			},
+		},
+	}, nil
+}
+
+func (m model) Init() tea.Cmd {
+	return tea.Batch(
+		textarea.Blink,
+		startCLI(m.cli),
+		listenForEvents(m.cli),
+	)
+}
+
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var (
+		tiCmd tea.Cmd
+		vpCmd tea.Cmd
+	)
+
+	m.textarea, tiCmd = m.textarea.Update(msg)
+	m.viewport, vpCmd = m.viewport.Update(msg)
+
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.Type {
+		case tea.KeyCtrlC:
+			if m.cli != nil {
+				m.cli.Stop()
+			}
+			return m, tea.Quit
+
+		case tea.KeyEnter:
+			// Send message
+			value := m.textarea.Value()
+			if value != "" && m.cli != nil {
+				// Add user message
+				m.messages = append(m.messages, message{
+					role:    "user",
+					content: value,
+				})
+
+				// Send to CLI
+				m.cli.SendMessage(value, m.module)
+				m.thinking = true
+
+				// Clear input
+				m.textarea.Reset()
+				m.updateViewport()
+			}
+			return m, nil
+		}
+
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+
+		if !m.ready {
+			// Initialize viewport
+			headerHeight := 2
+			footerHeight := 2
+			inputHeight := 3
+
+			m.viewport = viewport.New(
+				msg.Width,
+				msg.Height-headerHeight-footerHeight-inputHeight,
+			)
+			m.ready = true
+			m.updateViewport()
+		} else {
+			m.viewport.Width = msg.Width
+			m.viewport.Height = msg.Height - 7
+			m.updateViewport()
+		}
+
+		m.textarea.SetWidth(msg.Width - 2)
+	}
+
+	return m, tea.Batch(tiCmd, vpCmd)
+}
+
+func (m *model) updateViewport() {
+	// Render messages simply and cleanly
+	var content string
+	for _, msg := range m.messages {
+		switch msg.role {
+		case "user":
+			content += userStyle.Render("You: " + msg.content) + "\n"
+		case "danni":
+			content += danniStyle.Render("Danni: " + msg.content) + "\n"
+		case "system":
+			content += lipgloss.NewStyle().
+				Foreground(fgSubtle).
+				Italic(true).
+				Align(lipgloss.Center).
+				Width(m.width).
+				Render(msg.content) + "\n\n"
+		default:
+			content += messageStyle.Render(msg.content) + "\n"
+		}
+	}
+
+	m.viewport.SetContent(content)
+	m.viewport.GotoBottom()
+}
+
+func (m model) View() string {
+	if !m.ready {
+		return "Initializing..."
+	}
+
+	// Simple header
+	header := headerStyle.Render(
+		fmt.Sprintf("DANNI %s | Session: %s", m.module, m.sessionID),
+	)
+
+	// Chat viewport
+	chat := m.viewport.View()
+
+	// Input area (or thinking indicator)
+	var input string
+	if m.thinking {
+		input = lipgloss.NewStyle().
+			Foreground(fgSubtle).
+			Padding(1).
+			Render("◐ Analyzing...")
+	} else {
+		input = inputStyle.Render(m.textarea.View())
+	}
+
+	// Simple status bar
+	status := statusStyle.Render(
+		fmt.Sprintf("Tokens: %d", m.tokensUsed),
+	)
+
+	// Compose the view - clean and simple
+	return baseStyle.Render(
+		lipgloss.JoinVertical(
+			lipgloss.Left,
+			header,
+			chat,
+			input,
+			status,
+		),
+	)
+}
+
+// Helper functions remain the same...
+func startCLI(cli *bridge.CLI) tea.Cmd {
+	return func() tea.Msg {
+		return cli.Start()
+	}
+}
+
+func listenForEvents(cli *bridge.CLI) tea.Cmd {
+	return func() tea.Msg {
+		select {
+		case resp := <-cli.Responses():
+			return resp
+		case err := <-cli.Errors():
+			return err
+		}
+	}
+}
+
+func main() {
+	m, err := initialModel()
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Simple program options
+	p := tea.NewProgram(
+		m,
+		tea.WithAltScreen(),
+		tea.WithMouseCellMotion(),
+	)
+
+	if _, err := p.Run(); err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
+}
